@@ -58,37 +58,18 @@ func (s *walletService) CreateWallet(ctx context.Context, req CreateWalletReques
 
 	now := time.Now().UTC()
 	wallet := &domain.Wallet{
-		ID:        walletID,
-		Balance:   req.InitialBalance,
-		Currency:  req.Currency,
-		Status:    domain.WalletStatusActive,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:             walletID,
+		Balance:        req.InitialBalance,
+		OpeningBalance: req.InitialBalance,
+		Currency:       req.Currency,
+		Status:         domain.WalletStatusActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}
 
 	err := s.repo.ExecuteInTransaction(ctx, func(tx *gorm.DB) error {
-		if err := s.repo.Wallets().Create(ctx, tx, wallet); err != nil {
-			return err
-		}
-
-		// If initial balance > 0, record initial funding ledger credit
-		if req.InitialBalance > 0 {
-			initialEntry := &domain.LedgerEntry{
-				ID:           "led_init_" + uuid.New().String(),
-				WalletID:     wallet.ID,
-				TransferID:   "initial_funding",
-				Type:         domain.LedgerEntryTypeCredit,
-				Amount:       req.InitialBalance,
-				BalanceAfter: req.InitialBalance,
-				CreatedAt:    now,
-			}
-			if err := s.repo.Ledgers().CreateEntries(ctx, tx, []*domain.LedgerEntry{initialEntry}); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.repo.Wallets().Create(ctx, tx, wallet)
 	})
-
 	if err != nil {
 		return nil, err
 	}
@@ -106,16 +87,18 @@ func (s *walletService) GetBalance(ctx context.Context, id string) (*WalletBalan
 		return nil, err
 	}
 
-	ledgerBal, err := s.repo.Ledgers().GetCalculatedBalance(ctx, id)
+	netTransferDelta, err := s.repo.Ledgers().GetCalculatedBalance(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate ledger balance: %w", err)
 	}
 
+	reconciledBal := wallet.OpeningBalance + netTransferDelta
+
 	return &WalletBalanceResponse{
 		WalletID:          wallet.ID,
 		StoredBalance:     wallet.Balance,
-		LedgerBalance:     ledgerBal,
-		IsAuditConsistent: wallet.Balance == ledgerBal,
+		LedgerBalance:     reconciledBal,
+		IsAuditConsistent: wallet.Balance == reconciledBal,
 		Currency:          wallet.Currency,
 	}, nil
 }

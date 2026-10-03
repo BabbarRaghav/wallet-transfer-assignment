@@ -38,6 +38,9 @@ func (h *TransferHandler) CreateTransfer(c echo.Context) error {
 		case errors.Is(err, domain.ErrSourceWalletNotFound),
 			errors.Is(err, domain.ErrDestinationWalletNotFound),
 			errors.Is(err, domain.ErrWalletNotFound):
+			if resp != nil {
+				return c.JSON(http.StatusNotFound, resp)
+			}
 			return c.JSON(http.StatusNotFound, echo.Map{"error": err.Error()})
 
 		case errors.Is(err, domain.ErrIdempotencyConflict):

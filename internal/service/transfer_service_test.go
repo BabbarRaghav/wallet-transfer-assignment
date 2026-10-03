@@ -288,6 +288,7 @@ func TestTransferService_ConcurrencyNoDoubleSpend(t *testing.T) {
 			if err == nil {
 				atomic.AddInt64(&successCount, 1)
 			} else {
+				assert.ErrorIs(t, err, domain.ErrInsufficientBalance)
 				atomic.AddInt64(&failCount, 1)
 			}
 		}(i)
@@ -468,4 +469,161 @@ func TestTransferService_MatchingNonUSDCurrency(t *testing.T) {
 	assert.Equal(t, int64(700), bal1.StoredBalance)
 	bal2, _ := walletSvc.GetBalance(ctx, "w_eur2")
 	assert.Equal(t, int64(800), bal2.StoredBalance)
+}
+
+func TestTransferService_NotFoundWalletIdempotency(t *testing.T) {
+	ctx := context.Background()
+	_, transferSvc, walletSvc := setupTestDB(t)
+
+	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_valid",
+		InitialBalance: 1000,
+	})
+	require.NoError(t, err)
+
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "not-found-idem-key",
+		FromWalletID:   "w_nonexistent",
+		ToWalletID:     "w_valid",
+		Amount:         100,
+	}
+
+	// First execution fails with ErrSourceWalletNotFound
+	resp1, err1 := transferSvc.ExecuteTransfer(ctx, req)
+	require.ErrorIs(t, err1, domain.ErrSourceWalletNotFound)
+	require.NotNil(t, resp1)
+	assert.Equal(t, domain.TransferStatusFailed, resp1.Status)
+	assert.False(t, resp1.IsReplay)
+
+	// Replay returns the exact same failed result idempotently
+	resp2, err2 := transferSvc.ExecuteTransfer(ctx, req)
+	require.ErrorIs(t, err2, domain.ErrSourceWalletNotFound)
+	require.NotNil(t, resp2)
+	assert.Equal(t, domain.TransferStatusFailed, resp2.Status)
+	assert.True(t, resp2.IsReplay)
+	assert.Equal(t, resp1.TransferID, resp2.TransferID)
+}
+
+func TestTransferService_InactiveWalletIdempotency(t *testing.T) {
+	ctx := context.Background()
+	db, transferSvc, walletSvc := setupTestDB(t)
+
+	w1, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_active",
+		InitialBalance: 1000,
+	})
+	require.NoError(t, err)
+
+	w2, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_frozen",
+		InitialBalance: 500,
+	})
+	require.NoError(t, err)
+
+	// Freeze wallet 2
+	err = db.Model(&domain.Wallet{}).Where("id = ?", w2.ID).Update("status", domain.WalletStatusFrozen).Error
+	require.NoError(t, err)
+
+	req := service.CreateTransferRequest{
+		IdempotencyKey: "inactive-idem-key",
+		FromWalletID:   w1.ID,
+		ToWalletID:     w2.ID,
+		Amount:         100,
+	}
+
+	// First execution fails with ErrWalletInactive
+	resp1, err1 := transferSvc.ExecuteTransfer(ctx, req)
+	require.ErrorIs(t, err1, domain.ErrWalletInactive)
+	require.NotNil(t, resp1)
+	assert.Equal(t, domain.TransferStatusFailed, resp1.Status)
+	assert.False(t, resp1.IsReplay)
+
+	// Replay returns the exact same failed result idempotently
+	resp2, err2 := transferSvc.ExecuteTransfer(ctx, req)
+	require.ErrorIs(t, err2, domain.ErrWalletInactive)
+	require.NotNil(t, resp2)
+	assert.Equal(t, domain.TransferStatusFailed, resp2.Status)
+	assert.True(t, resp2.IsReplay)
+	assert.Equal(t, resp1.TransferID, resp2.TransferID)
+}
+
+func TestLedger_SystemWideDoubleEntryBalance(t *testing.T) {
+	ctx := context.Background()
+	db, transferSvc, walletSvc := setupTestDB(t)
+
+	// Create 3 wallets with opening balances
+	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_1", InitialBalance: 1000})
+	require.NoError(t, err)
+	_, err = walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_2", InitialBalance: 500})
+	require.NoError(t, err)
+	_, err = walletSvc.CreateWallet(ctx, service.CreateWalletRequest{ID: "w_3", InitialBalance: 200})
+	require.NoError(t, err)
+
+	// Before any transfers, zero ledger entries should exist (opening balances are outside the transfer ledger)
+	var initialCount int64
+	err = db.Model(&domain.LedgerEntry{}).Count(&initialCount).Error
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), initialCount, "Transfer ledger should be empty before transfers")
+
+	// Execute several transfers
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "t1", FromWalletID: "w_1", ToWalletID: "w_2", Amount: 300,
+	})
+	require.NoError(t, err)
+
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "t2", FromWalletID: "w_2", ToWalletID: "w_3", Amount: 150,
+	})
+	require.NoError(t, err)
+
+	_, err = transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "t3", FromWalletID: "w_3", ToWalletID: "w_1", Amount: 50,
+	})
+	require.NoError(t, err)
+
+	// Fetch all ledger entries
+	var allEntries []domain.LedgerEntry
+	err = db.Find(&allEntries).Error
+	require.NoError(t, err)
+
+	// Exactly 3 transfers * 2 entries = 6 entries total
+	assert.Len(t, allEntries, 6)
+
+	// Calculate system-wide debits and credits
+	var totalDebits int64
+	var totalCredits int64
+	entriesByTransfer := make(map[string][]domain.LedgerEntry)
+
+	for _, entry := range allEntries {
+		entriesByTransfer[entry.TransferID] = append(entriesByTransfer[entry.TransferID], entry)
+		if entry.Type == domain.LedgerEntryTypeDebit {
+			totalDebits += entry.Amount
+		} else if entry.Type == domain.LedgerEntryTypeCredit {
+			totalCredits += entry.Amount
+		}
+	}
+
+	// 1. System-wide ledger MUST perfectly balance to zero
+	assert.Equal(t, totalDebits, totalCredits, "Total debits must equal total credits system-wide")
+
+	// 2. Every transfer MUST have exactly two balanced entries
+	for transferID, entries := range entriesByTransfer {
+		assert.Len(t, entries, 2, "Transfer %s must have exactly 2 entries", transferID)
+		assert.True(t, (entries[0].Type == domain.LedgerEntryTypeDebit && entries[1].Type == domain.LedgerEntryTypeCredit) ||
+			(entries[0].Type == domain.LedgerEntryTypeCredit && entries[1].Type == domain.LedgerEntryTypeDebit))
+		assert.Equal(t, entries[0].Amount, entries[1].Amount)
+	}
+
+	// 3. All wallets must be audit-consistent
+	bal1, _ := walletSvc.GetBalance(ctx, "w_1")
+	assert.True(t, bal1.IsAuditConsistent)
+	assert.Equal(t, int64(750), bal1.StoredBalance) // 1000 - 300 + 50
+
+	bal2, _ := walletSvc.GetBalance(ctx, "w_2")
+	assert.True(t, bal2.IsAuditConsistent)
+	assert.Equal(t, int64(650), bal2.StoredBalance) // 500 + 300 - 150
+
+	bal3, _ := walletSvc.GetBalance(ctx, "w_3")
+	assert.True(t, bal3.IsAuditConsistent)
+	assert.Equal(t, int64(300), bal3.StoredBalance) // 200 + 150 - 50
 }

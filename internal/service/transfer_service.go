@@ -100,6 +100,12 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 						return &cachedResp, domain.ErrCurrencyMismatch
 					case domain.ErrWalletInactive.Error():
 						return &cachedResp, domain.ErrWalletInactive
+					case domain.ErrSourceWalletNotFound.Error():
+						return &cachedResp, domain.ErrSourceWalletNotFound
+					case domain.ErrDestinationWalletNotFound.Error():
+						return &cachedResp, domain.ErrDestinationWalletNotFound
+					case domain.ErrWalletNotFound.Error():
+						return &cachedResp, domain.ErrWalletNotFound
 					default:
 						return &cachedResp, errors.New(cachedResp.FailureReason)
 					}
@@ -153,14 +159,43 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		// C. Acquire row locks in deterministic order (lexicographically by ID)
 		fromWallet, toWallet, err := s.repo.Wallets().GetPairForUpdate(ctx, tx, req.FromWalletID, req.ToWalletID)
 		if err != nil {
-			// Failed to acquire/find wallets
+			// Persist expected not-found domain errors for idempotent replay
+			if errors.Is(err, domain.ErrSourceWalletNotFound) ||
+				errors.Is(err, domain.ErrDestinationWalletNotFound) ||
+				errors.Is(err, domain.ErrWalletNotFound) {
+				transfer.Status = domain.TransferStatusFailed
+				transfer.FailureReason = err.Error()
+				_ = s.repo.Transfers().Update(ctx, tx, transfer)
+				failedResp := TransferResponse{
+					TransferID:     transferID,
+					IdempotencyKey: req.IdempotencyKey,
+					FromWalletID:   req.FromWalletID,
+					ToWalletID:     req.ToWalletID,
+					Amount:         req.Amount,
+					Currency:       req.Currency,
+					Status:         domain.TransferStatusFailed,
+					FailureReason:  transfer.FailureReason,
+					CreatedAt:      now,
+				}
+				respBytes, _ := json.Marshal(failedResp)
+				idempotencyRec.Status = domain.IdempotencyStatusFailed
+				idempotencyRec.ResponseCode = 404
+				idempotencyRec.ResponseBody = string(respBytes)
+				_ = s.repo.Idempotency().Update(ctx, tx, idempotencyRec)
+				finalResponse = failedResp
+				txErr = err
+				return nil
+			}
+			// Unexpected database failure or validation error (e.g. same wallet) rolls back
+			return err
+		}
+		// D. Wallet status validations
+		if !fromWallet.IsActive() || !toWallet.IsActive() {
 			transfer.Status = domain.TransferStatusFailed
-			transfer.FailureReason = err.Error()
+			transfer.FailureReason = domain.ErrWalletInactive.Error()
 			_ = s.repo.Transfers().Update(ctx, tx, transfer)
 
-			idempotencyRec.Status = domain.IdempotencyStatusFailed
-			idempotencyRec.ResponseCode = 422
-			respBytes, _ := json.Marshal(TransferResponse{
+			failedResp := TransferResponse{
 				TransferID:     transferID,
 				IdempotencyKey: req.IdempotencyKey,
 				FromWalletID:   req.FromWalletID,
@@ -170,21 +205,17 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 				Status:         domain.TransferStatusFailed,
 				FailureReason:  transfer.FailureReason,
 				CreatedAt:      now,
-			})
-			idempotencyRec.ResponseBody = string(respBytes)
-			_ = s.repo.Idempotency().Update(ctx, tx, idempotencyRec)
-			return err
-		}
-
-		// D. Wallet status validations
-		if !fromWallet.IsActive() || !toWallet.IsActive() {
-			transfer.Status = domain.TransferStatusFailed
-			transfer.FailureReason = domain.ErrWalletInactive.Error()
-			_ = s.repo.Transfers().Update(ctx, tx, transfer)
-
+			}
+			respBytes, _ := json.Marshal(failedResp)
 			idempotencyRec.Status = domain.IdempotencyStatusFailed
 			idempotencyRec.ResponseCode = 422
-			return domain.ErrWalletInactive
+			idempotencyRec.ResponseBody = string(respBytes)
+			if err := s.repo.Idempotency().Update(ctx, tx, idempotencyRec); err != nil {
+				return fmt.Errorf("failed to finalize failed idempotency record: %w", err)
+			}
+			finalResponse = failedResp
+			txErr = domain.ErrWalletInactive
+			return nil
 		}
 
 		// E. Currency validations: reject cross-currency transfers and request currency mismatches
@@ -208,7 +239,9 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			idempotencyRec.Status = domain.IdempotencyStatusFailed
 			idempotencyRec.ResponseCode = 422
 			idempotencyRec.ResponseBody = string(respBytes)
-			_ = s.repo.Idempotency().Update(ctx, tx, idempotencyRec)
+			if err := s.repo.Idempotency().Update(ctx, tx, idempotencyRec); err != nil {
+				return fmt.Errorf("failed to finalize failed idempotency record: %w", err)
+			}
 
 			finalResponse = failedResp
 			txErr = domain.ErrCurrencyMismatch
@@ -224,7 +257,9 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 		if fromWallet.Balance < req.Amount {
 			transfer.Status = domain.TransferStatusFailed
 			transfer.FailureReason = domain.ErrInsufficientBalance.Error()
-			_ = s.repo.Transfers().Update(ctx, tx, transfer)
+			if err := s.repo.Transfers().Update(ctx, tx, transfer); err != nil {
+				return fmt.Errorf("failed to mark transfer as failed: %w", err)
+			}
 
 			failedResp := TransferResponse{
 				TransferID:     transferID,
@@ -241,7 +276,9 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			idempotencyRec.Status = domain.IdempotencyStatusFailed
 			idempotencyRec.ResponseCode = 422
 			idempotencyRec.ResponseBody = string(respBytes)
-			_ = s.repo.Idempotency().Update(ctx, tx, idempotencyRec)
+			if err := s.repo.Idempotency().Update(ctx, tx, idempotencyRec); err != nil {
+				return fmt.Errorf("failed to finalize failed idempotency record: %w", err)
+			}
 
 			finalResponse = failedResp
 			txErr = domain.ErrInsufficientBalance

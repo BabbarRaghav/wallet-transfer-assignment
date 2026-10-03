@@ -17,9 +17,7 @@ import (
 func InitDB(databaseURL string) (*gorm.DB, error) {
 	var dialector gorm.Dialector
 
-	isSQLite := strings.HasPrefix(databaseURL, "sqlite:") ||
-		strings.Contains(databaseURL, ".db") ||
-		strings.Contains(databaseURL, ":memory:")
+	isSQLite := strings.HasPrefix(databaseURL, "sqlite:") || databaseURL == ":memory:"
 
 	if isSQLite {
 		sqlitePath := strings.TrimPrefix(databaseURL, "sqlite://")
