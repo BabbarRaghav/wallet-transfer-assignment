@@ -189,4 +189,23 @@ func TestTransferHandler_FullFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
 	assert.Contains(t, rec.Body.String(), "FAILED")
+
+	// 5. Currency Mismatch Transfer (422 Unprocessable Entity)
+	currMismatchReq := service.CreateTransferRequest{
+		IdempotencyKey: "test-curr-mismatch-key",
+		FromWalletID:   "w_sender",
+		ToWalletID:     "w_receiver",
+		Amount:         10,
+		Currency:       "EUR", // w_sender and w_receiver are USD
+	}
+	body, _ = json.Marshal(currMismatchReq)
+	req = httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec = httptest.NewRecorder()
+	c = env.echo.NewContext(req, rec)
+
+	err = env.transferHandler.CreateTransfer(c)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	assert.Contains(t, rec.Body.String(), "FAILED")
 }

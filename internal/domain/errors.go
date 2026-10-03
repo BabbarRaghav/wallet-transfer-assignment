@@ -35,4 +35,7 @@ var (
 
 	// ErrTransferNotFound is returned when a transfer lookup fails.
 	ErrTransferNotFound = errors.New("transfer not found")
+
+	// ErrCurrencyMismatch indicates wallet currencies do not match each other or the transfer request.
+	ErrCurrencyMismatch = errors.New("currency mismatch between wallets or request")
 )

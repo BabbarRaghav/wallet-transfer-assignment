@@ -52,6 +52,12 @@ func (h *TransferHandler) CreateTransfer(c echo.Context) error {
 			}
 			return c.JSON(http.StatusUnprocessableEntity, echo.Map{"error": err.Error()})
 
+		case errors.Is(err, domain.ErrCurrencyMismatch):
+			if resp != nil {
+				return c.JSON(http.StatusUnprocessableEntity, resp)
+			}
+			return c.JSON(http.StatusUnprocessableEntity, echo.Map{"error": err.Error()})
+
 		case errors.Is(err, domain.ErrWalletInactive):
 			return c.JSON(http.StatusUnprocessableEntity, echo.Map{"error": err.Error()})
 

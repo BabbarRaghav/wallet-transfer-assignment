@@ -364,3 +364,108 @@ func TestTransferService_ConcurrencyCrossTransfersNoDeadlock(t *testing.T) {
 	assert.Equal(t, int64(1000), balB.StoredBalance)
 	assert.True(t, balB.IsAuditConsistent)
 }
+
+func TestTransferService_CurrencyMismatch(t *testing.T) {
+	ctx := context.Background()
+	_, transferSvc, walletSvc := setupTestDB(t)
+
+	// Create USD wallet and EUR wallet
+	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_usd",
+		InitialBalance: 1000,
+		Currency:       "USD",
+	})
+	require.NoError(t, err)
+
+	_, err = walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_eur",
+		InitialBalance: 1000,
+		Currency:       "EUR",
+	})
+	require.NoError(t, err)
+
+	// 1. Cross-wallet currency mismatch (USD -> EUR)
+	resp, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "cross-curr-key-1",
+		FromWalletID:   "w_usd",
+		ToWalletID:     "w_eur",
+		Amount:         100,
+		Currency:       "USD",
+	})
+	require.ErrorIs(t, err, domain.ErrCurrencyMismatch)
+	require.NotNil(t, resp)
+	assert.Equal(t, domain.TransferStatusFailed, resp.Status)
+	assert.Equal(t, domain.ErrCurrencyMismatch.Error(), resp.FailureReason)
+
+	// Balances remain untouched
+	balUSD, _ := walletSvc.GetBalance(ctx, "w_usd")
+	assert.Equal(t, int64(1000), balUSD.StoredBalance)
+	balEUR, _ := walletSvc.GetBalance(ctx, "w_eur")
+	assert.Equal(t, int64(1000), balEUR.StoredBalance)
+
+	// 2. Request currency does not match wallet currencies
+	_, err = walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_usd2",
+		InitialBalance: 500,
+		Currency:       "USD",
+	})
+	require.NoError(t, err)
+
+	resp2, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "req-curr-mismatch-key",
+		FromWalletID:   "w_usd",
+		ToWalletID:     "w_usd2",
+		Amount:         100,
+		Currency:       "EUR", // Request asks for EUR on USD wallets
+	})
+	require.ErrorIs(t, err, domain.ErrCurrencyMismatch)
+	require.NotNil(t, resp2)
+	assert.Equal(t, domain.TransferStatusFailed, resp2.Status)
+
+	// 3. Replay returns the failed currency mismatch response consistently
+	replayResp, replayErr := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "cross-curr-key-1",
+		FromWalletID:   "w_usd",
+		ToWalletID:     "w_eur",
+		Amount:         100,
+		Currency:       "USD",
+	})
+	require.ErrorIs(t, replayErr, domain.ErrCurrencyMismatch)
+	assert.True(t, replayResp.IsReplay)
+	assert.Equal(t, domain.TransferStatusFailed, replayResp.Status)
+}
+
+func TestTransferService_MatchingNonUSDCurrency(t *testing.T) {
+	ctx := context.Background()
+	_, transferSvc, walletSvc := setupTestDB(t)
+
+	_, err := walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_eur1",
+		InitialBalance: 1000,
+		Currency:       "EUR",
+	})
+	require.NoError(t, err)
+
+	_, err = walletSvc.CreateWallet(ctx, service.CreateWalletRequest{
+		ID:             "w_eur2",
+		InitialBalance: 500,
+		Currency:       "EUR",
+	})
+	require.NoError(t, err)
+
+	// Transfer without explicit currency inherits EUR from wallets
+	resp, err := transferSvc.ExecuteTransfer(ctx, service.CreateTransferRequest{
+		IdempotencyKey: "eur-transfer-key",
+		FromWalletID:   "w_eur1",
+		ToWalletID:     "w_eur2",
+		Amount:         300,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, domain.TransferStatusProcessed, resp.Status)
+	assert.Equal(t, "EUR", resp.Currency)
+
+	bal1, _ := walletSvc.GetBalance(ctx, "w_eur1")
+	assert.Equal(t, int64(700), bal1.StoredBalance)
+	bal2, _ := walletSvc.GetBalance(ctx, "w_eur2")
+	assert.Equal(t, int64(800), bal2.StoredBalance)
+}

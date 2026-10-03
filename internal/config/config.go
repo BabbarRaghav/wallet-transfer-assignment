@@ -22,6 +22,7 @@ func DefaultConfig() *Config {
 		Port:        "8080",
 		Environment: "development",
 		LogLevel:    "info",
+		DatabaseURL: "postgres://raghav@localhost:5432/wallet_transfer?sslmode=disable",
 	}
 }
 

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -67,9 +68,6 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 	if req.Amount <= 0 {
 		return nil, domain.ErrInvalidAmount
 	}
-	if req.Currency == "" {
-		req.Currency = "USD"
-	}
 
 	// 2. Hash payload for idempotency verification
 	canonicalPayload, err := json.Marshal(req)
@@ -95,7 +93,16 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			if err := json.Unmarshal([]byte(existingRecord.ResponseBody), &cachedResp); err == nil {
 				cachedResp.IsReplay = true
 				if existingRecord.Status == domain.IdempotencyStatusFailed {
-					return &cachedResp, domain.ErrInsufficientBalance
+					switch cachedResp.FailureReason {
+					case domain.ErrInsufficientBalance.Error():
+						return &cachedResp, domain.ErrInsufficientBalance
+					case domain.ErrCurrencyMismatch.Error():
+						return &cachedResp, domain.ErrCurrencyMismatch
+					case domain.ErrWalletInactive.Error():
+						return &cachedResp, domain.ErrWalletInactive
+					default:
+						return &cachedResp, errors.New(cachedResp.FailureReason)
+					}
 				}
 				return &cachedResp, nil
 			}
@@ -180,7 +187,40 @@ func (s *transferService) ExecuteTransfer(ctx context.Context, req CreateTransfe
 			return domain.ErrWalletInactive
 		}
 
-		// E. Check balance
+		// E. Currency validations: reject cross-currency transfers and request currency mismatches
+		if fromWallet.Currency != toWallet.Currency || (req.Currency != "" && req.Currency != fromWallet.Currency) {
+			transfer.Status = domain.TransferStatusFailed
+			transfer.FailureReason = domain.ErrCurrencyMismatch.Error()
+			_ = s.repo.Transfers().Update(ctx, tx, transfer)
+
+			failedResp := TransferResponse{
+				TransferID:     transferID,
+				IdempotencyKey: req.IdempotencyKey,
+				FromWalletID:   req.FromWalletID,
+				ToWalletID:     req.ToWalletID,
+				Amount:         req.Amount,
+				Currency:       req.Currency,
+				Status:         domain.TransferStatusFailed,
+				FailureReason:  transfer.FailureReason,
+				CreatedAt:      now,
+			}
+			respBytes, _ := json.Marshal(failedResp)
+			idempotencyRec.Status = domain.IdempotencyStatusFailed
+			idempotencyRec.ResponseCode = 422
+			idempotencyRec.ResponseBody = string(respBytes)
+			_ = s.repo.Idempotency().Update(ctx, tx, idempotencyRec)
+
+			finalResponse = failedResp
+			txErr = domain.ErrCurrencyMismatch
+			return nil
+		}
+
+		if req.Currency == "" {
+			req.Currency = fromWallet.Currency
+			transfer.Currency = fromWallet.Currency
+		}
+
+		// F. Check balance
 		if fromWallet.Balance < req.Amount {
 			transfer.Status = domain.TransferStatusFailed
 			transfer.FailureReason = domain.ErrInsufficientBalance.Error()
